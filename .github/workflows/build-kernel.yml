@@ -40,11 +40,13 @@ jobs:
         echo "清理完成，磁盘空间现状："
         df -h
         
-        echo "创建 10GB Swap 虚拟内存，防止 LTO 链接时 OOM 内存溢出..."
-        sudo fallocate -l 10G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
+        echo "创建 10GB Swap 虚拟内存..."
+        sudo swapoff -a || true
+        sudo rm -f /mnt/swapfile
+        sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=10240 status=progress
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
         
         echo "内存状态现状："
         free -h
@@ -66,32 +68,30 @@ jobs:
       run: |
         mkdir -p $GITHUB_WORKSPACE/clang
         cd $GITHUB_WORKSPACE/clang
-        # 拉取最新稳定的 Android 15 Clang (Clang 18/19)
         curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz
         tar -xf clang-r522817.tar.gz
         rm clang-r522817.tar.gz
 
     - name: Clone Kernel Source (Ace Pro / 10T Branch)
       run: |
-        # 使用 --depth=1 浅克隆，再次节省大量硬盘和时间
         git clone --depth=1 --branch oneplus/sm8475_v_15.0.0_oneplus_ace_pro https://github.com/OnePlusOSS/android_kernel_oneplus_sm8475.git kernel
         
     - name: Inject SUSFS Core Patches
       run: |
-        # 浅克隆 SUSFS 补丁库
         git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs
         cd kernel
-        # 应用针对 Kernel 5.10 的 SUSFS 源码补丁
         cp -r ../susfs/kernel_patches/fs/* fs/
         cp -r ../susfs/kernel_patches/include/linux/* include/linux/
         patch -p1 < ../susfs/kernel_patches/5.10/susfs.patch
-        # 将 SUSFS 宏添加到内核配置
         echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/vendor/waipio-qgki_defconfig
         echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> arch/arm64/configs/vendor/waipio-qgki_defconfig
 
-    - name: Apply Docker/LXC Defconfig Patches
+    - name: Apply Docker/LXC & Extreme Speed Defconfig Patches
       run: |
         cat << 'EOF' >> kernel/arch/arm64/configs/vendor/waipio-qgki_defconfig
+        CONFIG_DEBUG_INFO=n
+        CONFIG_LTO_CLANG_THIN=y
+        CONFIG_LTO_CLANG_FULL=n
         CONFIG_NAMESPACES=y
         CONFIG_NET_NS=y
         CONFIG_PID_NS=y
@@ -140,8 +140,8 @@ jobs:
         
         make O=out vendor/waipio-qgki_defconfig
         
-        # 启用 ccache 和全套 LLVM 工具链加速
-        make -j$(nproc) O=out CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LLVM=1 LLVM_IAS=1 Image.gz dtb.img
+        # 强制 LTO=thin 环境变量，配合 ccache 和全套 LLVM 工具链加速
+        make -j$(nproc --all) O=out CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LTO=thin LLVM=1 LLVM_IAS=1 Image.gz dtb.img
         
         if [ ! -f out/arch/arm64/boot/Image.gz ]; then
           echo "Kernel compilation failed! Please check logs or connect via tmate."
@@ -159,7 +159,6 @@ jobs:
       run: |
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
         rm -rf AnyKernel3/.git
-        # 配置 AnyKernel3
         sed -i 's/kernel.string=Custom Kernel/kernel.string=OnePlus Ace Pro Docker+SUSFS Kernel/g' AnyKernel3/anykernel.sh
         sed -i 's/block=auto/block=\/dev\/block\/bootdevice\/by-name\/boot/g' AnyKernel3/anykernel.sh
         
