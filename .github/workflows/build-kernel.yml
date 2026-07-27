@@ -1,0 +1,133 @@
+name: Build OnePlus Ace Pro Kernel (Docker/systemd + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_on_failure:
+        description: '编译失败时开启 SSH 调试 (tmate)'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-24.04
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3
+        
+    - name: Download AOSP Clang
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/clang
+        cd $GITHUB_WORKSPACE/clang
+        # 拉取最新稳定的 Android 15 Clang (Clang 18/19)
+        curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz
+        tar -xf clang-r522817.tar.gz
+        rm clang-r522817.tar.gz
+
+    - name: Clone Kernel Source (Ace Pro / 10T Branch)
+      run: |
+        git clone --depth=1 --branch oneplus/sm8475_v_15.0.0_oneplus_ace_pro https://github.com/OnePlusOSS/android_kernel_oneplus_sm8475.git kernel
+        
+    - name: Inject SUSFS Core Patches
+      run: |
+        # 克隆 SUSFS 补丁库
+        git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs
+        cd kernel
+        # 应用针对 Kernel 5.10 的 SUSFS 源码补丁
+        cp -r ../susfs/kernel_patches/fs/* fs/
+        cp -r ../susfs/kernel_patches/include/linux/* include/linux/
+        patch -p1 < ../susfs/kernel_patches/5.10/susfs.patch
+        # 将 SUSFS 宏添加到内核配置
+        echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/vendor/waipio-qgki_defconfig
+        echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> arch/arm64/configs/vendor/waipio-qgki_defconfig
+
+    - name: Apply Docker/LXC Defconfig Patches
+      run: |
+        cat << 'EOF' >> kernel/arch/arm64/configs/vendor/waipio-qgki_defconfig
+        CONFIG_NAMESPACES=y
+        CONFIG_NET_NS=y
+        CONFIG_PID_NS=y
+        CONFIG_IPC_NS=y
+        CONFIG_UTS_NS=y
+        CONFIG_USER_NS=y
+        CONFIG_CGROUPS=y
+        CONFIG_CGROUP_CPUACCT=y
+        CONFIG_CGROUP_DEVICE=y
+        CONFIG_CGROUP_FREEZER=y
+        CONFIG_CGROUP_SCHED=y
+        CONFIG_CPUSETS=y
+        CONFIG_MEMCG=y
+        CONFIG_CGROUP_PIDS=y
+        CONFIG_CGROUP_PERF=y
+        CONFIG_CGROUP_HUGETLB=y
+        CONFIG_NET_CLS_CGROUP=y
+        CONFIG_CFS_BANDWIDTH=y
+        CONFIG_VETH=y
+        CONFIG_BRIDGE=y
+        CONFIG_BRIDGE_NETFILTER=y
+        CONFIG_IP_NF_FILTER=y
+        CONFIG_IP_NF_TARGET_MASQUERADE=y
+        CONFIG_IP_NF_NAT=y
+        CONFIG_NF_NAT=y
+        CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+        CONFIG_NETFILTER_XT_MATCH_IPVS=y
+        CONFIG_IP6_NF_NAT=y
+        CONFIG_IP6_NF_TARGET_MASQUERADE=y
+        CONFIG_IP_VS=y
+        CONFIG_MACVLAN=y
+        CONFIG_DUMMY=y
+        CONFIG_POSIX_MQUEUE=y
+        CONFIG_KEYS=y
+        CONFIG_OVERLAY_FS=y
+        EOF
+
+    - name: Compile Kernel
+      id: compile
+      run: |
+        cd kernel
+        export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+        export CLANG_TRIPLE="aarch64-linux-gnu-"
+        export CROSS_COMPILE="aarch64-linux-android-"
+        export ARCH=arm64
+        
+        make O=out vendor/waipio-qgki_defconfig
+        make -j$(nproc) O=out CC=clang LLVM=1 LLVM_IAS=1 Image.gz dtb.img
+        
+        if [ ! -f out/arch/arm64/boot/Image.gz ]; then
+          echo "Kernel compilation failed! Please check logs or connect via tmate."
+          exit 1
+        fi
+
+    - name: Setup tmate Session (On Failure)
+      if: ${{ failure() && inputs.debug_on_failure }}
+      uses: mxschmitt/action-tmate@v3
+      with:
+        limit-access-to-actor: true
+        
+    - name: Package with AnyKernel3
+      if: ${{ success() }}
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+        rm -rf AnyKernel3/.git
+        # 配置 AnyKernel3
+        sed -i 's/kernel.string=Custom Kernel/kernel.string=OnePlus Ace Pro Docker+SUSFS Kernel/g' AnyKernel3/anykernel.sh
+        sed -i 's/block=auto/block=\/dev\/block\/bootdevice\/by-name\/boot/g' AnyKernel3/anykernel.sh
+        
+        cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
+        cd AnyKernel3
+        zip -r9 ../OnePlus_Ace_Pro_Docker_SUSFS_Kernel.zip *
+        
+    - name: Upload Artifact
+      if: ${{ success() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: OnePlus_Ace_Pro_Docker_SUSFS_Kernel
+        path: OnePlus_Ace_Pro_Docker_SUSFS_Kernel.zip
