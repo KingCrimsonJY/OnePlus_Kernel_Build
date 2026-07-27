@@ -15,9 +15,6 @@ jobs:
     runs-on: ubuntu-24.04
     
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-
     - name: Display Runner Hardware Specs
       run: |
         echo "=== CPU Info ==="
@@ -26,6 +23,9 @@ jobs:
         free -h
         echo "=== Disk Info ==="
         df -h
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
     - name: Maximize Runner Disk Space & Create Swap
       run: |
@@ -75,16 +75,6 @@ jobs:
     - name: Clone Kernel Source (Ace Pro / 10T Branch)
       run: |
         git clone --depth=1 --branch oneplus/sm8475_v_15.0.0_oneplus_ace_pro https://github.com/OnePlusOSS/android_kernel_oneplus_sm8475.git kernel
-        
-    - name: Inject SUSFS Core Patches
-      run: |
-        git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs
-        cd kernel
-        cp -r ../susfs/kernel_patches/fs/* fs/
-        cp -r ../susfs/kernel_patches/include/linux/* include/linux/
-        patch -p1 < ../susfs/kernel_patches/5.10/susfs.patch
-        echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/vendor/waipio-qgki_defconfig
-        echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> arch/arm64/configs/vendor/waipio-qgki_defconfig
 
     - name: Apply Docker/LXC & Extreme Speed Defconfig Patches
       run: |
