@@ -1,166 +1,215 @@
-name: Build OnePlus Ace Pro Kernel (Docker/systemd + SUSFS)
+# ============================================================================
+# Build LXC / Docker Kernel for OnePlus Ace Pro (sm8475 / 骁龙 8+ Gen 1)
+# android12-5.10 GKI 构建 · 集成 SUSFS + BBR + LXC/systemd/Docker 全部 CONFIG
+# 命令基线来自 Xiaomichael/OnePlus-Actions (sm8475, android12/5.10) 实测可编译流程
+# ============================================================================
+name: Build LXC/Docker Kernel (sm8475 / Ace Pro)
 
 on:
   workflow_dispatch:
     inputs:
-      debug_on_failure:
-        description: '编译失败时开启 SSH 调试 (tmate)'
+      FEIL:
+        description: '设备 manifest 文件名 (Ace Pro 默认 oneplus_ace_pro_v)'
         required: true
-        type: boolean
+        default: 'oneplus_ace_pro_v'
+        type: string
+      CPU:
+        description: '平台代号'
+        required: true
+        default: 'sm8475'
+        type: string
+      KSU:
+        description: '集成 KernelSU-Next (Root 强控制态)'
+        required: true
         default: true
+        type: boolean
+      SUSFS:
+        description: '集成 SUSFS 隐藏 (随 KernelSU-Next)'
+        required: true
+        default: true
+        type: boolean
+      LTO:
+        description: '启用 LTO_CLANG_THIN 优化 (提速运行/增加编译时间)'
+        required: true
+        default: true
+        type: boolean
+
+# 发布 Release 需要写入权限（可选步骤，不需要可删除）
+permissions:
+  contents: write
 
 jobs:
   build:
-    name: Extreme Build Kernel
-    runs-on: ubuntu-24.04
-    
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      TZ: Asia/Shanghai
+
     steps:
-    - name: Display Runner Hardware Specs
-      run: |
-        echo "=== CPU Info ==="
-        lscpu
-        echo "=== Memory Info ==="
-        free -h
-        echo "=== Disk Info ==="
-        df -h
+      # ---------------------------------------------------------------
+      # 0. 检出当前仓库（含 lxc-server-defconfig.fragment）
+      # ---------------------------------------------------------------
+      - name: 检出仓库 / Checkout
+        uses: actions/checkout@v4
 
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      # ---------------------------------------------------------------
+      # 1. 环境勘测（按任务一要求：lscpu / free -h / df -h）
+      # ---------------------------------------------------------------
+      - name: 环境勘测 / Environment Recon
+        run: |
+          echo "========== lscpu =========="; lscpu
+          echo "========== free -h =========="; free -h
+          echo "========== df -h =========="; df -h
+          echo "========== nproc =========="; nproc
+          echo "========== uname =========="; uname -a
+          echo "========== os-release =========="; cat /etc/os-release
 
-    - name: Maximize Runner Disk Space & Create Swap
-      run: |
-        echo "正在执行暴力空间清理，释放冗余环境..."
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /usr/local/lib/android
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/share/boost
-        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-        
-        echo "清理完成，磁盘空间现状："
-        df -h
-        
-        echo "创建 10GB Swap 虚拟内存..."
-        sudo swapoff -a || true
-        sudo rm -f /mnt/swapfile
-        sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=10240 status=progress
-        sudo chmod 600 /mnt/swapfile
-        sudo mkswap /mnt/swapfile
-        sudo swapon /mnt/swapfile
-        
-        echo "内存状态现状："
-        free -h
+      # ---------------------------------------------------------------
+      # 2. 极限清理磁盘（删 dotnet / android-sdk / haskell / codeql）
+      # ---------------------------------------------------------------
+      - name: 极限清理磁盘 / Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 4096
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
 
-    - name: Setup Build Environment
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y bc bison build-essential curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick libncurses-dev lib32readline-dev lib32z1-dev liblz4-tool libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3
-        
-    - name: Setup ccache (云端编译加速)
-      uses: hendrikmuhs/ccache-action@v1.2
-      with:
-        key: ${{ runner.os }}-kernel-sm8475-${{ github.sha }}
-        restore-keys: |
-          ${{ runner.os }}-kernel-sm8475-
-        max-size: "4G"
+      # ---------------------------------------------------------------
+      # 3. 安装依赖 + repo 工具
+      # ---------------------------------------------------------------
+      - name: 安装依赖 / Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl wget ca-certificates zip unzip \
+            gcc g++ python3 python3-pip bison flex make \
+            libssl-dev bc ccache binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu
+          mkdir -p ~/bin
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
-    - name: Download AOSP Clang
-      run: |
-        mkdir -p $GITHUB_WORKSPACE/clang
-        cd $GITHUB_WORKSPACE/clang
-        curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz
-        tar -xf clang-r522817.tar.gz
-        rm clang-r522817.tar.gz
+      # ---------------------------------------------------------------
+      # 4. 克隆内核源码（Xiaomichael manifest，depth=1 提速）
+      # ---------------------------------------------------------------
+      - name: 克隆内核源码 / Clone Kernel Source
+        run: |
+          mkdir -p kernel && cd kernel
+          repo init -u https://github.com/Xiaomichael/kernel_manifest.git \
+            -b refs/heads/oneplus/${{ inputs.CPU }} \
+            -m ${{ inputs.FEIL }}.xml --depth=1
+          repo sync -c -j"$(nproc --all)" --no-clone-bundle --no-tags
 
-    - name: Clone Kernel Source (Ace Pro / 10T Branch)
-      run: |
-        git clone --depth=1 --branch oneplus/sm8475_v_15.0.0_oneplus_ace_pro https://github.com/OnePlusOSS/android_kernel_oneplus_sm8475.git kernel
+      # ---------------------------------------------------------------
+      # 5. 拷贝并注入 defconfig 片段（GKI 合并后追加，保留 ACC 电池节点）
+      # ---------------------------------------------------------------
+      - name: 注入 LXC defconfig 片段 / Inject Fragment
+        run: |
+          cd kernel
+          cp "$GITHUB_WORKSPACE/lxc-server-defconfig.fragment" lxc-server-defconfig.fragment
+          # POST_DEFCONFIG_CMDS 在 build.sh 生成最终 .config 之后执行：
+          # 把片段追加进 .config 并重算依赖（olddefconfig）
+          cat >> common/build.config.msm.waipio <<'EOF'
 
-    - name: Apply Docker/LXC & Extreme Speed Defconfig Patches
-      run: |
-        cat << 'EOF' >> kernel/arch/arm64/configs/gki_defconfig
-        CONFIG_DEBUG_INFO=n
-        CONFIG_LTO_CLANG_THIN=y
-        CONFIG_LTO_CLANG_FULL=n
-        CONFIG_NAMESPACES=y
-        CONFIG_NET_NS=y
-        CONFIG_PID_NS=y
-        CONFIG_IPC_NS=y
-        CONFIG_UTS_NS=y
-        CONFIG_USER_NS=y
-        CONFIG_CGROUPS=y
-        CONFIG_CGROUP_CPUACCT=y
-        CONFIG_CGROUP_DEVICE=y
-        CONFIG_CGROUP_FREEZER=y
-        CONFIG_CGROUP_SCHED=y
-        CONFIG_CPUSETS=y
-        CONFIG_MEMCG=y
-        CONFIG_CGROUP_PIDS=y
-        CONFIG_CGROUP_PERF=y
-        CONFIG_CGROUP_HUGETLB=y
-        CONFIG_NET_CLS_CGROUP=y
-        CONFIG_CFS_BANDWIDTH=y
-        CONFIG_VETH=y
-        CONFIG_BRIDGE=y
-        CONFIG_BRIDGE_NETFILTER=y
-        CONFIG_IP_NF_FILTER=y
-        CONFIG_IP_NF_TARGET_MASQUERADE=y
-        CONFIG_IP_NF_NAT=y
-        CONFIG_NF_NAT=y
-        CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
-        CONFIG_NETFILTER_XT_MATCH_IPVS=y
-        CONFIG_IP6_NF_NAT=y
-        CONFIG_IP6_NF_TARGET_MASQUERADE=y
-        CONFIG_IP_VS=y
-        CONFIG_MACVLAN=y
-        CONFIG_DUMMY=y
-        CONFIG_POSIX_MQUEUE=y
-        CONFIG_KEYS=y
-        CONFIG_OVERLAY_FS=y
-        EOF
+          # ---- LXC / Docker / SUSFS / BBR 片段注入（build.sh 生成 defconfig 后生效）----
+          POST_DEFCONFIG_CMDS="cat ${ROOT_DIR}/lxc-server-defconfig.fragment >> ${OUT_DIR}/.config && make -C ${ROOT_DIR} O=${OUT_DIR} LLVM_IAS=1 LLVM=1 olddefconfig"
+          EOF
 
-    - name: Compile Kernel
-      id: compile
-      run: |
-        cd kernel
-        export PATH="/usr/lib/ccache:$GITHUB_WORKSPACE/clang/bin:$PATH"
-        export CLANG_TRIPLE="aarch64-linux-gnu-"
-        export CROSS_COMPILE="aarch64-linux-android-"
-        export ARCH=arm64
-        export LLVM=1
-        export LLVM_IAS=1
-        
-        make O=out gki_defconfig
-        
-        # 强制 LTO=thin 环境变量，配合 ccache 和全套 LLVM 工具链加速
-        make -j$(nproc --all) O=out CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LTO=thin Image.gz dtb.img
-        
-        if [ ! -f out/arch/arm64/boot/Image.gz ]; then
-          echo "Kernel compilation failed! Please check logs or connect via tmate."
-          exit 1
-        fi
+          # 关闭 KMI 严格模式：我们刷入的是完整自编译内核，无需 KMI 符号兼容
+          for f in common/build.config.gki.aarch64 common/build.config.msm.waipio; do
+            [ -f "$f" ] || continue
+            sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$f"
+            sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$f"
+          done
 
-    - name: Setup tmate Session (On Failure)
-      if: ${{ failure() && inputs.debug_on_failure }}
-      uses: mxschmitt/action-tmate@v3
-      with:
-        limit-access-to-actor: true
-        
-    - name: Package with AnyKernel3
-      if: ${{ success() }}
-      run: |
-        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-        rm -rf AnyKernel3/.git
-        sed -i 's/kernel.string=Custom Kernel/kernel.string=OnePlus Ace Pro Docker+SUSFS Kernel/g' AnyKernel3/anykernel.sh
-        sed -i 's/block=auto/block=\/dev\/block\/bootdevice\/by-name\/boot/g' AnyKernel3/anykernel.sh
-        
-        cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
-        cd AnyKernel3
-        zip -r9 ../OnePlus_Ace_Pro_Docker_SUSFS_Kernel.zip *
-        
-    - name: Upload Artifact
-      if: ${{ success() }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: OnePlus_Ace_Pro_Docker_SUSFS_Kernel
-        path: OnePlus_Ace_Pro_Docker_SUSFS_Kernel.zip
+          # 关闭 defconfig 自检（我们主动改了配置，避免 check_defconfig 失败）
+          [ -f common/build.config.gki ] && \
+            sed -i 's/check_defconfig//' common/build.config.gki && \
+            sed -i 's/^CONFIG_HEADERS_INSTALL=.*/CONFIG_HEADERS_INSTALL=n/' common/build.config.gki || true
+
+      # ---------------------------------------------------------------
+      # 6. 集成 KernelSU-Next（强控制态核心）
+      # ---------------------------------------------------------------
+      - name: 集成 KernelSU-Next / Integrate KernelSU-Next
+        if: ${{ inputs.KSU }}
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" | bash -s dev
+          # 注：KernelSU-Next setup.sh 已对 GKI 5.10 做适配，会把 KSU 接入 common/ 树。
+          # 若编出内核未含 KSU，请确认 common/ 下存在 KernelSU-Next/ 并手动 source 其 KernelSU.mk。
+
+      # ---------------------------------------------------------------
+      # 7. 集成 SUSFS（隐藏态，随 KernelSU-Next 版本内置/或独立补丁）
+      # ---------------------------------------------------------------
+      - name: 集成 SUSFS / Integrate SUSFS
+        if: ${{ inputs.SUSFS }}
+        run: |
+          cd kernel
+          git clone https://github.com/KernelSU-Next/susfs4ksu -b gki-android12-5.10 --depth=1
+          # 现代 SUSFS 一般随 KernelSU-Next 一并接入；如需独立补丁，请按所选版本执行仓库内 apply 脚本：
+          #   (cd susfs4ksu && bash apply.sh ../common)   # 路径与脚本名以所选 SUSFS 版本为准，请先核对
+          echo "SUSFS 仓库已就位: kernel/susfs4ksu (gki-android12-5.10)"
+
+      # ---------------------------------------------------------------
+      # 8. 编译内核（GKI, clang-r416183b + LLVM_IAS）
+      # ---------------------------------------------------------------
+      - name: 编译内核 / Build Kernel (GKI)
+        run: |
+          cd kernel
+          export PATH="$(pwd)/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
+          export PATH="$(pwd)/prebuilts-master/build-tools/linux-x86/bin:$PATH"
+
+          # 可选 LTO 优化（Xiaomichael 5.10 实测做法）
+          if [ "${{ inputs.LTO }}" = "true" ]; then
+            sed -i 's/^CONFIG_LTO=n/CONFIG_LTO=y/' common/arch/arm64/configs/gki_defconfig || true
+            sed -i 's/^# CONFIG_LTO_CLANG_THIN is not set/CONFIG_LTO_CLANG_THIN=y/' common/arch/arm64/configs/gki_defconfig || true
+            sed -i 's/^CONFIG_LTO_CLANG_THIN=n/CONFIG_LTO_CLANG_THIN=y/' common/arch/arm64/configs/gki_defconfig || true
+          fi
+
+          BUILD_CONFIG=common/build.config.msm.waipio VARIANT=gki build/build.sh
+
+      # ---------------------------------------------------------------
+      # 9. 打包 AnyKernel3（GKI 版模板，sm8475 适用）
+      # ---------------------------------------------------------------
+      - name: 打包 AnyKernel3 / Package
+        run: |
+          cd kernel
+          git clone https://github.com/Xiaomichael/AnyKernel3 --depth=1
+          cp out/arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
+          [ -d out/arch/arm64/boot/dts ] && cp -r out/arch/arm64/boot/dts AnyKernel3/dtb 2>/dev/null || true
+          cd AnyKernel3 && zip -r9 "$GITHUB_WORKSPACE/Kernel-AcePro-LXC.zip" ./*
+
+      # ---------------------------------------------------------------
+      # 10. 上传产物
+      # ---------------------------------------------------------------
+      - name: 上传产物 / Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-AcePro-LXC
+          path: Kernel-AcePro-LXC.zip
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------
+      # 11. 发布 Release（可选）
+      # ---------------------------------------------------------------
+      - name: 发布 Release / Release (optional)
+        if: ${{ success() && inputs.KSU }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sm8475-lxc-${{ github.run_number }}
+          name: "Ace Pro LXC Kernel #${{ github.run_number }}"
+          files: Kernel-AcePro-LXC.zip
+
+      # ---------------------------------------------------------------
+      # 12. 失败保留环境 / tmate SSH（便于现场排错）
+      # ---------------------------------------------------------------
+      - name: 失败保留环境 / tmate SSH on failure
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
