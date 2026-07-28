@@ -179,7 +179,6 @@ jobs:
           'CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y' \
           'CONFIG_KSU_SUSFS_SUS_MOUNT=y' \
           'CONFIG_KSU_SUSFS_SUS_PATH=y' \
-          'CONFIG_KSU_SUSFS_SUS_SU=y' \
           'CONFIG_KSU_SUSFS_SPOOF_UNAME=y' \
           'CONFIG_KSU_MANUAL_HOOK=y' \
           '# 10. BBR + FQ' \
@@ -190,6 +189,14 @@ jobs:
           'CONFIG_TCP_CONG_WESTWOOD=n' \
           'CONFIG_TCP_CONG_HTCP=n' \
           'CONFIG_TCP_CONG_CUBIC=y' \
+          '# 10b. 服务器增强' \
+          'CONFIG_WIREGUARD=y' \
+          'CONFIG_ZRAM=y' \
+          'CONFIG_CGROUP_V2=y' \
+          'CONFIG_CPU_FREQ_GOV_PERFORMANCE=y' \
+          'CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y' \
+          'CONFIG_CPU_FREQ_GOV_POWERSAVE=y' \
+          'CONFIG_BRIDGE_IGMP_SNOOPING=y' \
           '# 11. 内核自述' \
           'CONFIG_IKCONFIG=y' \
           'CONFIG_IKCONFIG_PROC=y' \
@@ -220,14 +227,22 @@ jobs:
       # ---------------------------------------------------------------
       # 7. 集成 SUSFS（隐藏态，随 KernelSU-Next 版本内置/或独立补丁）
       # ---------------------------------------------------------------
-      - name: 集成 SUSFS / Integrate SUSFS
+      - name: 集成 SUSFS / Integrate SUSFS (gki-android12-5.10)
         if: ${{ inputs.SUSFS }}
         run: |
           cd kernel
-          git clone https://github.com/KernelSU-Next/susfs4ksu -b gki-android12-5.10 --depth=1
-          # 现代 SUSFS 一般随 KernelSU-Next 一并接入；如需独立补丁，请按所选版本执行仓库内 apply 脚本：
-          #   (cd susfs4ksu && bash apply.sh ../common)   # 路径与脚本名以所选 SUSFS 版本为准，请先核对
-          echo "SUSFS 仓库已就位: kernel/susfs4ksu (gki-android12-5.10)"
+          # SUSFS 2.0 已随 KernelSU main 重定基，废弃 SUS_SU，改用 inline hooks（不依赖 KPROBES）
+          # 注意：SUSFS 是“补丁集”，仅 clone 不会生效，必须按官方 README 复制并 patch
+          git clone https://gitlab.com/simonpunk/susfs4ksu -b gki-android12-5.10 --depth=1 susfs4ksu
+          # 复制补丁与新增源文件（KernelSU-Next 目录名为 KernelSU-Next，非 KernelSU）
+          cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU-Next/
+          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_kernel-*.patch ./common/
+          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+          # 施加补丁（10_ 打到 KernelSU-Next 目录，50_ 打到 common 目录）
+          ( cd ./KernelSU-Next && patch -p1 < 10_enable_susfs_for_ksu.patch )
+          ( cd ./common && for f in 50_add_susfs_in_kernel-*.patch; do patch -p1 < "$f"; done )
+          echo "SUSFS 2.0 补丁已施加 (gki-android12-5.10)"
 
       # ---------------------------------------------------------------
       # 8. 编译内核（GKI, clang-r416183b + LLVM_IAS）
