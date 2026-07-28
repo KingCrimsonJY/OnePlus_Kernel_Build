@@ -111,26 +111,100 @@ jobs:
       - name: 注入 LXC defconfig 片段 / Inject Fragment
         run: |
           cd kernel
-          cp "$GITHUB_WORKSPACE/lxc-server-defconfig.fragment" lxc-server-defconfig.fragment
-          # POST_DEFCONFIG_CMDS 在 build.sh 生成最终 .config 之后执行：
-          # 把片段追加进 .config 并重算依赖（olddefconfig）
-          cat >> common/build.config.msm.waipio <<'EOF'
-
-          # ---- LXC / Docker / SUSFS / BBR 片段注入（build.sh 生成 defconfig 后生效）----
-          POST_DEFCONFIG_CMDS="cat ${ROOT_DIR}/lxc-server-defconfig.fragment >> ${OUT_DIR}/.config && make -C ${ROOT_DIR} O=${OUT_DIR} LLVM_IAS=1 LLVM=1 olddefconfig"
-          EOF
-
+          # 生成片段文件：优先用仓库根内的 lxc-server-defconfig.fragment；
+          # 若缺失则用内联 printf 生成，保证 self-contained（彻底规避 heredoc 缩进坑）。
+          if [ -f "$GITHUB_WORKSPACE/lxc-server-defconfig.fragment" ]; then
+            cp "$GITHUB_WORKSPACE/lxc-server-defconfig.fragment" lxc-server-defconfig.fragment
+          else
+            printf '%s\n' \
+          '# === OnePlus Ace Pro (sm8475) LXC/Docker/SUSFS/BBR 片段（内联生成，等效于 lxc-server-defconfig.fragment）===' \
+          '# 红线：绝不改动 CONFIG_QTI_BATTERY_CHARGER / CONFIG_OPLUS_CHG* / CONFIG_OPLUS_SM8450_CHARGER 等电池节点' \
+          '# 1. 命名空间 (依赖 CONFIG_NAMESPACES)' \
+          'CONFIG_PID_NS=y' \
+          'CONFIG_IPC_NS=y' \
+          'CONFIG_USER_NS=y' \
+          'CONFIG_UTS_NS=y' \
+          'CONFIG_NET_NS=y' \
+          '# 2. systemd 依赖' \
+          'CONFIG_POSIX_MQUEUE=y' \
+          'CONFIG_CGROUP_DEVICE=y' \
+          'CONFIG_AUDIT=y' \
+          'CONFIG_AUDITSYSCALL=y' \
+          'CONFIG_SECURITY_APPARMOR=y' \
+          'CONFIG_AUTOFS_FS=y' \
+          'CONFIG_FANOTIFY=y' \
+          'CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y' \
+          '# 3. cgroups (依赖 CONFIG_CGROUPS)' \
+          'CONFIG_CGROUP_PIDS=y' \
+          'CONFIG_CGROUP_PERF=y' \
+          'CONFIG_CGROUP_HUGETLB=y' \
+          'CONFIG_CGROUP_RDMA=y' \
+          'CONFIG_NET_CLS_CGROUP=y' \
+          'CONFIG_CFS_BANDWIDTH=y' \
+          '# 4. Docker bridge/NAT' \
+          'CONFIG_BRIDGE_NETFILTER=y' \
+          'CONFIG_IP6_NF_NAT=y' \
+          'CONFIG_IP6_NF_TARGET_MASQUERADE=y' \
+          'CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y' \
+          'CONFIG_NETFILTER_XT_MATCH_IPVS=y' \
+          'CONFIG_NETFILTER_XT_MATCH_COMMENT=y' \
+          'CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y' \
+          '# 5. IPVS' \
+          'CONFIG_IP_VS=y' \
+          'CONFIG_IP_VS_NFCT=y' \
+          'CONFIG_IP_VS_PROTO_TCP=y' \
+          'CONFIG_IP_VS_PROTO_UDP=y' \
+          'CONFIG_IP_VS_RR=y' \
+          'CONFIG_IP_VS_WRR=y' \
+          'CONFIG_IP_VS_SH=y' \
+          '# 6. nftables' \
+          'CONFIG_NF_TABLES=y' \
+          'CONFIG_NFT_COMPAT=y' \
+          'CONFIG_NFT_CT=y' \
+          'CONFIG_NFT_FIB=y' \
+          'CONFIG_NFT_FIB_IPV4=y' \
+          'CONFIG_NFT_FIB_IPV6=y' \
+          'CONFIG_NFT_MASQ=y' \
+          'CONFIG_NFT_NAT=y' \
+          '# 7. overlay/macvlan/ipvlan' \
+          'CONFIG_VXLAN=y' \
+          'CONFIG_BRIDGE_VLAN_FILTERING=y' \
+          'CONFIG_MACVLAN=y' \
+          'CONFIG_IPVLAN=y' \
+          'CONFIG_TUN=y' \
+          '# 8. KernelSU-Next' \
+          'CONFIG_KSU=y' \
+          '# 9. SUSFS' \
+          'CONFIG_KSU_SUSFS=y' \
+          'CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y' \
+          'CONFIG_KSU_SUSFS_SUS_MOUNT=y' \
+          'CONFIG_KSU_SUSFS_SUS_PATH=y' \
+          'CONFIG_KSU_SUSFS_SUS_SU=y' \
+          'CONFIG_KSU_SUSFS_SPOOF_UNAME=y' \
+          'CONFIG_KSU_MANUAL_HOOK=y' \
+          '# 10. BBR + FQ' \
+          'CONFIG_TCP_CONG_ADVANCED=y' \
+          'CONFIG_TCP_CONG_BBR=y' \
+          'CONFIG_NET_SCH_FQ=y' \
+          'CONFIG_TCP_CONG_BIC=n' \
+          'CONFIG_TCP_CONG_WESTWOOD=n' \
+          'CONFIG_TCP_CONG_HTCP=n' \
+          'CONFIG_TCP_CONG_CUBIC=y' \
+          '# 11. 内核自述' \
+          'CONFIG_IKCONFIG=y' \
+          'CONFIG_IKCONFIG_PROC=y' \
+          > lxc-server-defconfig.fragment
+          fi
+          # 注入 POST_DEFCONFIG_CMDS（单行 printf，规避 heredoc 缩进坑）
+          printf '\n# ---- LXC/Docker/SUSFS/BBR 片段注入（build.sh 生成 defconfig 后生效）----\nPOST_DEFCONFIG_CMDS="cat ${ROOT_DIR}/lxc-server-defconfig.fragment >> ${OUT_DIR}/.config && make -C ${ROOT_DIR} O=${OUT_DIR} LLVM_IAS=1 LLVM=1 olddefconfig"\n' >> common/build.config.msm.waipio
           # 关闭 KMI 严格模式：我们刷入的是完整自编译内核，无需 KMI 符号兼容
           for f in common/build.config.gki.aarch64 common/build.config.msm.waipio; do
             [ -f "$f" ] || continue
             sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$f"
             sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$f"
           done
-
           # 关闭 defconfig 自检（我们主动改了配置，避免 check_defconfig 失败）
-          [ -f common/build.config.gki ] && \
-            sed -i 's/check_defconfig//' common/build.config.gki && \
-            sed -i 's/^CONFIG_HEADERS_INSTALL=.*/CONFIG_HEADERS_INSTALL=n/' common/build.config.gki || true
+          [ -f common/build.config.gki ] && { sed -i 's/check_defconfig//' common/build.config.gki; sed -i 's/^CONFIG_HEADERS_INSTALL=.*/CONFIG_HEADERS_INSTALL=n/' common/build.config.gki; } || true
 
       # ---------------------------------------------------------------
       # 6. 集成 KernelSU-Next（强控制态核心）
