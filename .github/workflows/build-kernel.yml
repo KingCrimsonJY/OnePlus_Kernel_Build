@@ -78,7 +78,7 @@ jobs:
 
     - name: Apply Docker/LXC & Extreme Speed Defconfig Patches
       run: |
-        cat << 'EOF' >> kernel/arch/arm64/configs/vendor/waipio-qgki_defconfig
+        cat << 'EOF' >> kernel/arch/arm64/configs/gki_defconfig
         CONFIG_DEBUG_INFO=n
         CONFIG_LTO_CLANG_THIN=y
         CONFIG_LTO_CLANG_FULL=n
@@ -130,7 +130,7 @@ jobs:
         export LLVM=1
         export LLVM_IAS=1
         
-        make O=out vendor/waipio-qgki_defconfig
+        make O=out gki_defconfig
         
         # 强制 LTO=thin 环境变量，配合 ccache 和全套 LLVM 工具链加速
         make -j$(nproc --all) O=out CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LTO=thin Image.gz dtb.img
