@@ -127,11 +127,13 @@ jobs:
         export CLANG_TRIPLE="aarch64-linux-gnu-"
         export CROSS_COMPILE="aarch64-linux-android-"
         export ARCH=arm64
+        export LLVM=1
+        export LLVM_IAS=1
         
         make O=out vendor/waipio-qgki_defconfig
         
         # 强制 LTO=thin 环境变量，配合 ccache 和全套 LLVM 工具链加速
-        make -j$(nproc --all) O=out CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LTO=thin LLVM=1 LLVM_IAS=1 Image.gz dtb.img
+        make -j$(nproc --all) O=out CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LTO=thin Image.gz dtb.img
         
         if [ ! -f out/arch/arm64/boot/Image.gz ]; then
           echo "Kernel compilation failed! Please check logs or connect via tmate."
