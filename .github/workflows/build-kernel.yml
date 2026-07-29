@@ -33,6 +33,11 @@ on:
         required: true
         default: true
         type: boolean
+      SSH:
+        description: '编译失败时开启 tmate SSH 现场排错（默认关闭，避免暴露会话）'
+        required: true
+        default: false
+        type: boolean
 
 # 发布 Release 需要写入权限（可选步骤，不需要可删除）
 permissions:
@@ -110,7 +115,8 @@ jobs:
       # ---------------------------------------------------------------
       - name: 注入 LXC defconfig 片段 / Inject Fragment
         run: |
-          cd kernel
+          # GKI 源码根：manifest 将 common 克隆到 kernel_platform/common
+          cd kernel/kernel_platform/common
           # 生成片段文件：优先用仓库根内的 lxc-server-defconfig.fragment；
           # 若缺失则用内联 printf 生成，保证 self-contained（彻底规避 heredoc 缩进坑）。
           if [ -f "$GITHUB_WORKSPACE/lxc-server-defconfig.fragment" ]; then
@@ -202,16 +208,24 @@ jobs:
           'CONFIG_IKCONFIG_PROC=y' \
           > lxc-server-defconfig.fragment
           fi
-          # 注入 POST_DEFCONFIG_CMDS（单行 printf，规避 heredoc 缩进坑）
-          printf '\n# ---- LXC/Docker/SUSFS/BBR 片段注入（build.sh 生成 defconfig 后生效）----\nPOST_DEFCONFIG_CMDS="cat ${ROOT_DIR}/lxc-server-defconfig.fragment >> ${OUT_DIR}/.config && make -C ${ROOT_DIR} O=${OUT_DIR} LLVM_IAS=1 LLVM=1 olddefconfig"\n' >> common/build.config.msm.waipio
+          # 注入 POST_DEFCONFIG_CMDS（build.sh 在生成 .config 后执行；${ROOT_DIR}=本目录）
+          BCFG="build.config.msm.waipio"
+          if [ -f "$BCFG" ]; then
+            sed -i '/POST_DEFCONFIG_CMDS=/d' "$BCFG"
+            printf '%s\n' '# ---- LXC/Docker/SUSFS/BBR 片段注入（build.sh 生成 defconfig 后生效）----
+POST_DEFCONFIG_CMDS="cat ${ROOT_DIR}/lxc-server-defconfig.fragment >> ${OUT_DIR}/.config && make -C ${ROOT_DIR} O=${OUT_DIR} LLVM_IAS=1 LLVM=1 olddefconfig"' >> "$BCFG"
+          else
+            echo "WARN: $BCFG 未找到，回退直接追加到 gki_defconfig"
+            cat lxc-server-defconfig.fragment >> arch/arm64/configs/gki_defconfig
+          fi
           # 关闭 KMI 严格模式：我们刷入的是完整自编译内核，无需 KMI 符号兼容
-          for f in common/build.config.gki.aarch64 common/build.config.msm.waipio; do
+          for f in build.config.gki.aarch64 build.config.msm.waipio; do
             [ -f "$f" ] || continue
             sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$f"
             sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$f"
           done
           # 关闭 defconfig 自检（我们主动改了配置，避免 check_defconfig 失败）
-          [ -f common/build.config.gki ] && { sed -i 's/check_defconfig//' common/build.config.gki; sed -i 's/^CONFIG_HEADERS_INSTALL=.*/CONFIG_HEADERS_INSTALL=n/' common/build.config.gki; } || true
+          [ -f build.config.gki ] && { sed -i 's/check_defconfig//' build.config.gki; sed -i 's/^CONFIG_HEADERS_INSTALL=.*/CONFIG_HEADERS_INSTALL=n/' build.config.gki; } || true
 
       # ---------------------------------------------------------------
       # 6. 集成 KernelSU-Next（强控制态核心）
@@ -219,7 +233,7 @@ jobs:
       - name: 集成 KernelSU-Next / Integrate KernelSU-Next
         if: ${{ inputs.KSU }}
         run: |
-          cd kernel
+          cd kernel/kernel_platform
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" | bash -s dev
           # 注：KernelSU-Next setup.sh 已对 GKI 5.10 做适配，会把 KSU 接入 common/ 树。
           # 若编出内核未含 KSU，请确认 common/ 下存在 KernelSU-Next/ 并手动 source 其 KernelSU.mk。
@@ -230,18 +244,20 @@ jobs:
       - name: 集成 SUSFS / Integrate SUSFS (gki-android12-5.10)
         if: ${{ inputs.SUSFS }}
         run: |
-          cd kernel
-          # SUSFS 2.0 已随 KernelSU main 重定基，废弃 SUS_SU，改用 inline hooks（不依赖 KPROBES）
+          cd kernel/kernel_platform
+          # SUSFS 2.0 已随 KernelSU-Next 重定基，废弃 SUS_SU，改用 inline hooks（不依赖 KPROBES）
           # 注意：SUSFS 是“补丁集”，仅 clone 不会生效，必须按官方 README 复制并 patch
           git clone https://gitlab.com/simonpunk/susfs4ksu -b gki-android12-5.10 --depth=1 susfs4ksu
-          # 复制补丁与新增源文件（KernelSU-Next 目录名为 KernelSU-Next，非 KernelSU）
-          cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU-Next/
-          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_kernel-*.patch ./common/
-          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
-          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
-          # 施加补丁（10_ 打到 KernelSU-Next 目录，50_ 打到 common 目录）
-          ( cd ./KernelSU-Next && patch -p1 < 10_enable_susfs_for_ksu.patch )
-          ( cd ./common && for f in 50_add_susfs_in_kernel-*.patch; do patch -p1 < "$f"; done )
+          # 10_ 补丁打到 KernelSU-Next 目录（KernelSU-Next 由上一阶段生成于 kernel_platform/）
+          SUS_PATCH=$(find ./susfs4ksu -name '10_enable_susfs_for_ksu.patch' | head -n1)
+          cp "$SUS_PATCH" ./KernelSU-Next/
+          ( cd ./KernelSU-Next && patch -p1 < "$(basename "$SUS_PATCH")" )
+          # 50_ 补丁 + 新增源文件打到 common（GKI 源码根）
+          cd common
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-*.patch ./
+          cp -r ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp -r ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          for f in 50_add_susfs_in_kernel-*.patch; do patch -p1 < "$f"; done
           echo "SUSFS 2.0 补丁已施加 (gki-android12-5.10)"
 
       # ---------------------------------------------------------------
@@ -249,25 +265,25 @@ jobs:
       # ---------------------------------------------------------------
       - name: 编译内核 / Build Kernel (GKI)
         run: |
-          cd kernel
-          export PATH="$(pwd)/prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
-          export PATH="$(pwd)/prebuilts-master/build-tools/linux-x86/bin:$PATH"
+          cd kernel/kernel_platform/common
+          export PATH="$(pwd)/../prebuilts-master/clang/host/linux-x86/clang-r416183b/bin:$PATH"
+          export PATH="$(pwd)/../prebuilts/kernel-build-tools/linux-x86/bin:$PATH"
 
           # 可选 LTO 优化（Xiaomichael 5.10 实测做法）
           if [ "${{ inputs.LTO }}" = "true" ]; then
-            sed -i 's/^CONFIG_LTO=n/CONFIG_LTO=y/' common/arch/arm64/configs/gki_defconfig || true
-            sed -i 's/^# CONFIG_LTO_CLANG_THIN is not set/CONFIG_LTO_CLANG_THIN=y/' common/arch/arm64/configs/gki_defconfig || true
-            sed -i 's/^CONFIG_LTO_CLANG_THIN=n/CONFIG_LTO_CLANG_THIN=y/' common/arch/arm64/configs/gki_defconfig || true
+            sed -i 's/^CONFIG_LTO=n/CONFIG_LTO=y/' arch/arm64/configs/gki_defconfig || true
+            sed -i 's/^# CONFIG_LTO_CLANG_THIN is not set/CONFIG_LTO_CLANG_THIN=y/' arch/arm64/configs/gki_defconfig || true
+            sed -i 's/^CONFIG_LTO_CLANG_THIN=n/CONFIG_LTO_CLANG_THIN=y/' arch/arm64/configs/gki_defconfig || true
           fi
 
-          BUILD_CONFIG=common/build.config.msm.waipio VARIANT=gki build/build.sh
+          BUILD_CONFIG=build.config.msm.waipio VARIANT=gki build/build.sh
 
       # ---------------------------------------------------------------
       # 9. 打包 AnyKernel3（GKI 版模板，sm8475 适用）
       # ---------------------------------------------------------------
       - name: 打包 AnyKernel3 / Package
         run: |
-          cd kernel
+          cd kernel/kernel_platform/common
           git clone https://github.com/Xiaomichael/AnyKernel3 --depth=1
           cp out/arch/arm64/boot/Image.lz4 AnyKernel3/Image.lz4
           [ -d out/arch/arm64/boot/dts ] && cp -r out/arch/arm64/boot/dts AnyKernel3/dtb 2>/dev/null || true
@@ -297,8 +313,8 @@ jobs:
       # ---------------------------------------------------------------
       # 12. 失败保留环境 / tmate SSH（便于现场排错）
       # ---------------------------------------------------------------
-      - name: 失败保留环境 / tmate SSH on failure
-        if: ${{ failure() }}
+      - name: 失败保留环境 / tmate SSH on failure (需手动开启 SSH 输入)
+        if: ${{ failure() && inputs.SSH }}
         uses: mxschmitt/action-tmate@v3
         with:
           limit-access-to-actor: true
